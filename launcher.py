@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-AI 启动台 —— 浅色绿色系的本地程序启动器。
+快捷启动台 —— 浅色绿色系的本地程序启动器。
 
 把一个程序（exe / bat / 网址 / 文件夹）做成一张圆角卡片，点一下就启动。
 配置存在同目录的 apps.json。
@@ -59,7 +59,7 @@ FONT_FAMILY = "Microsoft YaHei UI"
 # ---------------------------------------------------------------- 配色
 BG = "#F4F7F4"            # 页面底色：带绿意的米白
 SURFACE = "#FFFFFF"       # 卡片
-SURFACE_HOVER = "#FCFEFC"
+SURFACE_HOVER = "#E1EDE6"
 FIELD = "#F3F7F3"         # 输入框填充
 BORDER = "#DCE6DE"        # 描边
 PRIMARY = "#6F9E82"       # 主色：低饱和鼠尾草绿
@@ -476,7 +476,8 @@ def app_image_name(app):
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            # utf-8-sig：允许别人用带 BOM 的编辑器/脚本改过配置文件
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             apps = data.get("apps", [])
             return {"apps": apps if isinstance(apps, list) else [], "window": data.get("window", {})}
@@ -930,8 +931,9 @@ class Launcher(tk.Tk):
         self._icon_cache = {}
         self._cols = 0
         self._scroll_frac = 0.0
+        self.active_category = None
 
-        self.title("AI 启动台")
+        self.title("快捷启动台")
         self.configure(bg=BG)
         self.minsize(px(680), px(520))
         geo = (self.cfg.get("window") or {}).get("geometry")
@@ -987,6 +989,10 @@ class Launcher(tk.Tk):
         self.header.pack(side="top", fill="x", padx=px(PAGE_PAD), pady=(px(8), 0))
         self.header.bind("<Configure>", lambda e: self._draw_header())
 
+        self.catbar = tk.Canvas(self, bg=BG, height=px(46), bd=0, highlightthickness=0)
+        self.catbar.pack(side="top", fill="x", padx=px(PAGE_PAD), pady=(px(2), 0))
+        self.catbar.bind("<Configure>", lambda e: self._draw_catbar())
+
         body = tk.Frame(self, bg=BG)
         body.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
@@ -1016,11 +1022,11 @@ class Launcher(tk.Tk):
                         shadow_blur=px(6), shadow_dy=px(2))
         self._logo_photo = ImageTk.PhotoImage(logo)
         h.create_image(0, px(16), anchor="nw", image=self._logo_photo)
-        h.create_text(logo_s / 2, px(16) + logo_s / 2 + px(1), text="AI", fill="#FFFFFF",
+        h.create_text(logo_s / 2, px(16) + logo_s / 2 + px(1), text="快", fill="#FFFFFF",
                       font=self.fonts["logo"])
-        h.create_text(logo_s + px(14), px(18), anchor="w", text="AI 启动台", fill=TEXT,
+        h.create_text(logo_s + px(14), px(18), anchor="w", text="快捷启动台", fill=TEXT,
                       font=self.fonts["title"])
-        h.create_text(logo_s + px(14), px(42), anchor="w", text="本地 AI 工具 · 一键启动",
+        h.create_text(logo_s + px(14), px(42), anchor="w", text="本地程序 · 一键启动",
                       fill=MUTED, font=self.fonts["subtitle"])
 
         btn_w, search_w, gap = 104, 216, 12
@@ -1046,6 +1052,53 @@ class Launcher(tk.Tk):
         h.create_window(btn_x, px(17), anchor="nw", window=self.btn_add,
                         width=px(btn_w), height=px(36))
         h.create_line(0, px(78), w, px(78), fill="#E9EFE9")
+
+    def _categories(self):
+        cats = []  # (value, label)
+        seen = set()
+        for a in self.apps:
+            c = (a.get("category") or "").strip()
+            if c not in seen:
+                seen.add(c)
+                cats.append((c, c or "未分类"))
+        return cats
+
+    def _draw_catbar(self):
+        cb = self.catbar
+        cb.delete("all")
+        w = max(cb.winfo_width(), px(320))
+        pills = [("全部", None)] + [(label, value) for value, label in self._categories()]
+        x = px(2)
+        y = px(8)
+        h = px(30)
+        gap = px(10)
+        self._cat_hit = []
+        for label, value in pills:
+            active = (self.active_category == value) if value is not None else (self.active_category is None)
+            tw = self.fonts["label"].measure(label)
+            pw = tw + px(26)
+            fill = PRIMARY if active else SURFACE
+            fg = "#FFFFFF" if active else TEXT_MID
+            outline = None if active else BORDER
+            img = rr_image(pw, h, h // 2, fill, outline=outline, outline_width=1,
+                           shadow=((*SHADOW[:3], 20) if active else None),
+                           shadow_blur=px(4), shadow_dy=px(1))
+            ph = ImageTk.PhotoImage(img)
+            setattr(self, f"_catimg_{x}", ph)
+            tag = f"cat_{label}"
+            cb.create_image(x, y, anchor="nw", image=ph, tags=(tag,))
+            cb.create_text(x + pw / 2, y + h / 2 + px(1), text=label, fill=fg,
+                           font=self.fonts["label"], tags=(tag,))
+            cb.tag_bind(tag, "<Button-1>", lambda e, v=value: self._on_cat_click(v))
+            self._cat_hit.append((x, pw, value))
+            x += pw + px(26) + gap
+        if hasattr(self, "_cat_photos"):
+            del self._cat_photos
+
+    def _on_cat_click(self, value):
+        self.active_category = value
+        self.refresh()
+        self._draw_catbar()
 
     def _draw_footer(self):
         f = self.footer
@@ -1162,9 +1215,11 @@ class Launcher(tk.Tk):
     def refresh(self):
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
         visible = [a for a in self.apps
-                   if not query or query in a.get("name", "").lower()
-                   or query in a.get("category", "").lower()
-                   or query in a.get("path", "").lower()]
+                   if (not query or query in a.get("name", "").lower()
+                       or query in a.get("category", "").lower()
+                       or query in a.get("path", "").lower())
+                   and (self.active_category is None
+                        or (a.get("category") or "").strip() == self.active_category)]
 
         for card in self.cards:
             card.destroy()
@@ -1181,6 +1236,8 @@ class Launcher(tk.Tk):
         self._start_icon_loader()
         if hasattr(self, "footer"):
             self._draw_footer()
+        if hasattr(self, "catbar"):
+            self._draw_catbar()
         if visible:
             self.select(self.cards[0], force=True)
 
