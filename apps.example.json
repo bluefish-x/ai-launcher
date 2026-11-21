@@ -1,0 +1,35 @@
+{
+  "apps": [
+    {
+      "name": "示例 · 程序",
+      "path": "C:\\Windows\\System32\\notepad.exe",
+      "workdir": "C:\\Windows\\System32",
+      "args": "",
+      "type": "exe",
+      "category": "示例",
+      "color": "#528a5c",
+      "desc": "改成你自己的 exe / bat 路径"
+    },
+    {
+      "name": "示例 · 网址",
+      "path": "http://127.0.0.1:8188",
+      "workdir": "",
+      "args": "",
+      "type": "web",
+      "category": "示例",
+      "color": "#4a7fa6",
+      "desc": "用默认浏览器打开"
+    },
+    {
+      "name": "示例 · 文件夹",
+      "path": "D:\\AI",
+      "workdir": "",
+      "args": "",
+      "type": "folder",
+      "category": "示例",
+      "color": "#a6714a",
+      "desc": "用资源管理器打开"
+    }
+  ],
+  "window": {}
+}
