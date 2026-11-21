@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-AI 启动台 —— 一个 Steam 风格的本地软件启动器。
+AI 启动台 —— 浅色绿色系的本地程序启动器。
 
-只做一件事：把你常用的程序（exe / bat / 网址 / 文件夹）排成一排卡片，点一下就启动。
-配置保存在同目录的 apps.json，可自由增删改。
+把一个程序（exe / bat / 网址 / 文件夹）做成一张圆角卡片，点一下就启动。
+配置存在同目录的 apps.json。
 
-依赖：Python 3.9+（tkinter）、Pillow（用于提取 exe 图标，缺失时自动退回字母图标）
+设计：低饱和绿主色 + 米白/浅灰辅助色，圆角、软阴影、充足留白、扁平化。
+几何尺寸按 96dpi 设计，运行时按系统 DPI 整体缩放（字体用 pt，随 DPI 自动缩放）。
+
+依赖：Python 3.9+（tkinter）、Pillow（圆角渲染、软阴影、exe 图标提取）
 """
 
 import ctypes
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -19,38 +21,64 @@ import time
 import traceback
 import webbrowser
 from ctypes import wintypes, byref
-from urllib.parse import urlparse
 
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox
 
 try:
-    from PIL import Image, ImageDraw, ImageTk
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
     HAS_PIL = True
 except Exception:  # pragma: no cover
     HAS_PIL = False
 
+
+def _system_scale():
+    """系统 DPI 缩放比例（96dpi = 1.0）。"""
+    try:
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi:
+            return max(1.0, dpi / 96.0)
+    except Exception:
+        pass
+    return 1.0
+
+
+S = _system_scale()
+
+
+def px(v):
+    """设计像素 -> 实际像素。"""
+    return int(round(v * S))
+
+
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
 CONFIG_PATH = os.path.join(APP_DIR, "apps.json")
+FONT_FAMILY = "Microsoft YaHei UI"
 
-# ---------------------------------------------------------------- 配色（Steam 风）
-BG = "#171a21"
-HEADER = "#1b2838"
-CARD = "#16202d"
-CARD_HOVER = "#1f3448"
-CARD_ACTIVE = "#233a52"
-BORDER = "#2a475e"
-ACCENT = "#66c0f4"
-GREEN = "#7ad46f"
-GRAY = "#5a6b7a"
-TEXT = "#c7d5e0"
-MUTED = "#8f98a0"
-WHITE = "#ffffff"
+# ---------------------------------------------------------------- 配色
+BG = "#F4F7F4"            # 页面底色：带绿意的米白
+SURFACE = "#FFFFFF"       # 卡片
+SURFACE_HOVER = "#FCFEFC"
+FIELD = "#F3F7F3"         # 输入框填充
+BORDER = "#DCE6DE"        # 描边
+PRIMARY = "#6F9E82"       # 主色：低饱和鼠尾草绿
+PRIMARY_DARK = "#5B8A6E"
+PRIMARY_SOFT = "#E9F2EC"  # 主色浅底
+PRIMARY_TINT = "#D9E9DF"
+TEXT = "#2E3A32"
+TEXT_MID = "#5F6C63"
+MUTED = "#93A096"
+SHADOW = (74, 96, 80, 26)
 
-CARD_W = 322
-CARD_H = 118
-GAP = 14
+# ---------------------------------------------------------------- 布局（设计像素）
+CARD_W, CARD_H = 356, 150
+BODY_W, BODY_H = 336, 128
+BODY_X, BODY_Y = 10, 8
+BODY_R = 16
+GAP_X, GAP_Y = 8, 8
+PAGE_PAD = 28
+ICON_SIZE = 54
 
 DEFAULT_APPS = [
     {
@@ -60,7 +88,7 @@ DEFAULT_APPS = [
         "args": "",
         "type": "exe",
         "category": "示例",
-        "color": "#528a5c",
+        "color": "#6F9E82",
         "desc": "改成你自己的 exe / bat 路径",
     },
     {
@@ -70,7 +98,7 @@ DEFAULT_APPS = [
         "args": "",
         "type": "web",
         "category": "示例",
-        "color": "#4a7fa6",
+        "color": "#8FA9B8",
         "desc": "用默认浏览器打开",
     },
     {
@@ -80,15 +108,95 @@ DEFAULT_APPS = [
         "args": "",
         "type": "folder",
         "category": "示例",
-        "color": "#a6714a",
+        "color": "#B9A88C",
         "desc": "用资源管理器打开",
     },
 ]
 
-TYPE_LABEL = {"exe": "程序", "web": "网址", "folder": "文件夹"}
+TYPE_CHOICES = [("exe", "程序"), ("web", "网址"), ("folder", "文件夹")]
+TYPE_LABEL = dict(TYPE_CHOICES)
 
 
-# ---------------------------------------------------------------- 图标提取（ctypes）
+# ---------------------------------------------------------------- 圆角 / 阴影
+_IMG_CACHE = {}
+
+
+def _pil_font(size, bold=False):
+    for name in (("msyhbd.ttc", "msyh.ttc") if bold else ("msyh.ttc", "msyhbd.ttc")):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.truetype("segoeui.ttf", size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def rr_image(w, h, r, fill, outline=None, outline_width=0, shadow=None,
+             shadow_blur=8, shadow_dy=3, inset=0):
+    """抗锯齿圆角矩形（可选柔和阴影）。inset 为四周边距，给阴影留出空间。"""
+    key = ("rr", w, h, r, fill, outline, outline_width, shadow, shadow_blur, shadow_dy, inset)
+    cached = _IMG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ss = 4
+    W, H = max(1, w * ss), max(1, h * ss)
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    box = [inset * ss, inset * ss, W - 1 - inset * ss, H - 1 - inset * ss]
+    if box[2] <= box[0] or box[3] <= box[1]:
+        box = [0, 0, W - 1, H - 1]
+
+    if shadow:
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        d = ImageDraw.Draw(layer)
+        d.rounded_rectangle([box[0], box[1] + shadow_dy * ss, box[2], box[3] + shadow_dy * ss],
+                            radius=r * ss, fill=shadow)
+        layer = layer.filter(ImageFilter.GaussianBlur(shadow_blur * ss))
+        canvas.alpha_composite(layer)
+
+    body = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(body)
+    d.rounded_rectangle(box, radius=r * ss, fill=fill, outline=outline,
+                        width=int(outline_width * ss) if outline else 0)
+    canvas.alpha_composite(body)
+
+    out = canvas.resize((w, h), Image.LANCZOS)
+    _IMG_CACHE[key] = out
+    return out
+
+
+def round_icon(img, size, radius_ratio=0.28):
+    if img is None:
+        return None
+    img = img.convert("RGBA").resize((size, size), Image.LANCZOS)
+    big = size * 4
+    mask = Image.new("L", (big, big), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, big - 1, big - 1],
+                                           radius=int(big * radius_ratio), fill=255)
+    mask = mask.resize((size, size), Image.LANCZOS)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(img, (0, 0), mask)
+    return out
+
+
+def ellipsize(text, font, max_width):
+    if not text:
+        return ""
+    if font.measure(text) <= max_width:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if font.measure(text[:mid] + "…") <= max_width:
+            lo = mid + 1
+        else:
+            hi = mid
+    return text[:max(0, lo - 1)] + "…"
+
+
+# ---------------------------------------------------------------- Win32：图标与进程
 class _SHFILEINFOW(ctypes.Structure):
     _fields_ = [
         ("hIcon", wintypes.HICON),
@@ -152,92 +260,10 @@ class _PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
-def running_images():
-    """返回当前所有进程的映像名（小写），用于判断“某个程序是否已在运行”。"""
-    names = set()
-    try:
-        k32 = ctypes.windll.kernel32
-        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
-        if snap in (0, -1):
-            return names
-        entry = _PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-        ok = k32.Process32FirstW(snap, byref(entry))
-        while ok:
-            names.add(entry.szExeFile.lower())
-            ok = k32.Process32NextW(snap, byref(entry))
-        k32.CloseHandle(snap)
-    except Exception:
-        pass
-    return names
-
-
-def child_processes(pid):
-    """返回以 pid 为父进程的 [(pid, 映像名)]。有些启动器是外壳，拉起真身就自己退出。"""
-    out = []
-    try:
-        k32 = ctypes.windll.kernel32
-        snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
-        if snap in (0, -1):
-            return out
-        entry = _PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
-        ok = k32.Process32FirstW(snap, byref(entry))
-        while ok:
-            if entry.th32ParentProcessID == pid:
-                out.append((entry.th32ProcessID, entry.szExeFile.lower()))
-            ok = k32.Process32NextW(snap, byref(entry))
-        k32.CloseHandle(snap)
-    except Exception:
-        pass
-    return out
-
-
-def process_start_time(pid):
-    """进程创建时间（Unix 时间戳），用来排除 PID 复用带来的无关进程。"""
-    try:
-        k32 = ctypes.windll.kernel32
-        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        k32.OpenProcess.restype = wintypes.HANDLE
-        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return None
-        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
-        ok = k32.GetProcessTimes(handle, byref(created), byref(exited), byref(kernel), byref(user))
-        k32.CloseHandle(handle)
-        if not ok:
-            return None
-        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
-        return ticks / 1e7 - 11644473600
-    except Exception:
-        return None
-
-
-_GENERIC_IMAGES = {"python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
-                   "conhost.exe", "explorer.exe", "java.exe"}
-
-
-def app_image_name(app):
-    """这个条目对应的进程映像名；无法唯一定位时返回 None。"""
-    path = app.get("path", "")
-    if app.get("type") != "exe" or not path:
-        return None
-    name = os.path.basename(path).lower()
-    if name in _GENERIC_IMAGES:
-        return None
-    return name
-
-
 def _setup_winapi():
-    """显式声明参数类型，否则 64 位句柄会被当成 32 位 int 截断，图标提取会随机失败。"""
+    """显式声明参数类型，否则 64 位句柄会被截断，图标提取会随机失败。"""
     user32, gdi32, shell32 = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.windll.shell32
+    user32.GetDpiForSystem.restype = wintypes.UINT
     user32.GetIconInfo.argtypes = [wintypes.HICON, ctypes.POINTER(_ICONINFO)]
     user32.GetIconInfo.restype = wintypes.BOOL
     user32.DestroyIcon.argtypes = [wintypes.HICON]
@@ -268,10 +294,18 @@ def _setup_winapi():
         wintypes.UINT, wintypes.UINT,
     ]
     shell32.SHGetFileInfoW.restype = ctypes.c_void_p
+    k32 = ctypes.windll.kernel32
+    k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
 
 
 def _hicon_to_image(hicon):
-    """把 Windows 图标句柄转成 PIL 图像（32 位 BGRA）。"""
     user32, gdi32 = ctypes.windll.user32, ctypes.windll.gdi32
     info = _ICONINFO()
     if not user32.GetIconInfo(hicon, byref(info)):
@@ -289,10 +323,10 @@ def _hicon_to_image(hicon):
         header = _BMIH()
         header.biSize = ctypes.sizeof(_BMIH)
         header.biWidth = width
-        header.biHeight = -height  # 自上而下
+        header.biHeight = -height
         header.biPlanes = 1
         header.biBitCount = 32
-        header.biCompression = 0  # BI_RGB
+        header.biCompression = 0
         buf = ctypes.create_string_buffer(width * height * 4)
         gdi32.GetDIBits(memdc, info.hbmColor, 0, height, buf, byref(header), 0)
         gdi32.SelectObject(memdc, old)
@@ -315,16 +349,13 @@ except Exception:
     pass
 
 
-def load_icon(path, size=72):
-    """提取文件图标并缩放到 size。返回 PIL.Image 或 None。"""
+def load_icon(path, size):
     if not HAS_PIL or not path or not os.path.exists(path):
         return None
     icon = wintypes.HICON()
     try:
-        # 优先 PrivateExtractIconsW，可拿到 256px 高清图标
         count = ctypes.windll.user32.PrivateExtractIconsW(
-            ctypes.c_wchar_p(path), 0, size * 2, size * 2, byref(icon), None, 1, 0
-        )
+            ctypes.c_wchar_p(path), 0, size * 2, size * 2, byref(icon), None, 1, 0)
         if count and icon.value:
             img = _hicon_to_image(icon)
             if img:
@@ -333,10 +364,8 @@ def load_icon(path, size=72):
         pass
     try:
         info = _SHFILEINFOW()
-        flags = 0x000000100 | 0x000000000  # SHGFI_ICON | SHGFI_LARGEICON
         res = ctypes.windll.shell32.SHGetFileInfoW(
-            ctypes.c_wchar_p(path), 0, byref(info), ctypes.sizeof(info), flags
-        )
+            ctypes.c_wchar_p(path), 0, byref(info), ctypes.sizeof(info), 0x100)
         if res and info.hIcon:
             img = _hicon_to_image(info.hIcon)
             if img:
@@ -346,47 +375,104 @@ def load_icon(path, size=72):
     return None
 
 
-def web_icon(color, size=72):
-    """网址条目用画出来的地球，避免字体里没有 emoji。"""
+def letter_icon(text, color, size):
     if not HAS_PIL:
         return None
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=int(size * 0.22), fill=color)
-    c, r = size / 2, size * 0.30
-    w = max(2, int(size * 0.045))
-    draw.ellipse([c - r, c - r, c + r, c + r], outline=(255, 255, 255, 235), width=w)
-    draw.ellipse([c - r * 0.42, c - r, c + r * 0.42, c + r], outline=(255, 255, 255, 235), width=w)
-    draw.line([c - r, c, c + r, c], fill=(255, 255, 255, 235), width=w)
-    draw.line([c, c - r, c, c + r], fill=(255, 255, 255, 235), width=w)
-    return img
+    img = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, size * 4 - 1, size * 4 - 1], radius=int(size * 4 * 0.28),
+                        fill=color)
+    d.text((size * 2, size * 2 - size * 0.05), (text or "?").strip()[:1].upper(),
+           font=_pil_font(int(size * 2.1), True), fill=(255, 255, 255, 245), anchor="mm")
+    return img.resize((size, size), Image.LANCZOS)
 
 
-def letter_icon(text, color, size=72):
-    """没有图标时用首字母方块兜底。"""
+def web_icon(color, size):
     if not HAS_PIL:
         return None
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=int(size * 0.22), fill=color)
-    ch = (text or "?").strip()[:1].upper()
+    s = size * 4
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([0, 0, s - 1, s - 1], radius=int(s * 0.28), fill=color)
+    c, r = s / 2, s * 0.28
+    w = max(2, int(s * 0.034))
+    white = (255, 255, 255, 235)
+    d.ellipse([c - r, c - r, c + r, c + r], outline=white, width=w)
+    d.ellipse([c - r * 0.42, c - r, c + r * 0.42, c + r], outline=white, width=w)
+    d.line([c - r, c, c + r, c], fill=white, width=w)
+    d.line([c, c - r, c, c + r], fill=white, width=w)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def running_images():
+    names = set()
     try:
-        from PIL import ImageFont
-        font = None
-        for name in ("msyhbd.ttc", "msyh.ttc", "segoeuib.ttf"):
-            try:
-                font = ImageFont.truetype(name, int(size * 0.52))
-                break
-            except Exception:
-                continue
-        draw.text((size / 2, size / 2 - size * 0.03), ch, font=font,
-                  fill=(255, 255, 255, 235), anchor="mm")
+        k32 = ctypes.windll.kernel32
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap in (0, -1):
+            return names
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, byref(entry))
+        while ok:
+            names.add(entry.szExeFile.lower())
+            ok = k32.Process32NextW(snap, byref(entry))
+        k32.CloseHandle(snap)
     except Exception:
-        draw.text((size * 0.36, size * 0.28), ch, fill=(255, 255, 255, 235))
-    return img
+        pass
+    return names
 
 
-# ---------------------------------------------------------------- 配置读写
+def child_processes(pid):
+    out = []
+    try:
+        k32 = ctypes.windll.kernel32
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)
+        if snap in (0, -1):
+            return out
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        ok = k32.Process32FirstW(snap, byref(entry))
+        while ok:
+            if entry.th32ParentProcessID == pid:
+                out.append((entry.th32ProcessID, entry.szExeFile.lower()))
+            ok = k32.Process32NextW(snap, byref(entry))
+        k32.CloseHandle(snap)
+    except Exception:
+        pass
+    return out
+
+
+def process_start_time(pid):
+    try:
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        ok = k32.GetProcessTimes(handle, byref(created), byref(exited), byref(kernel), byref(user))
+        k32.CloseHandle(handle)
+        if not ok:
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        return ticks / 1e7 - 11644473600
+    except Exception:
+        return None
+
+
+_GENERIC_IMAGES = {"python.exe", "pythonw.exe", "cmd.exe", "powershell.exe",
+                   "conhost.exe", "explorer.exe", "java.exe"}
+
+
+def app_image_name(app):
+    path = app.get("path", "")
+    if app.get("type") != "exe" or not path:
+        return None
+    name = os.path.basename(path).lower()
+    return None if name in _GENERIC_IMAGES else name
+
+
+# ---------------------------------------------------------------- 配置
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
@@ -406,116 +492,307 @@ def save_config(cfg):
     os.replace(tmp, CONFIG_PATH)
 
 
-def short_path(path, limit=44):
-    if not path:
-        return ""
-    if path.startswith("http"):
-        return path
-    txt = path.replace("/", "\\")
-    if len(txt) <= limit:
-        return txt
-    parts = txt.split("\\")
-    if len(parts) > 2:
-        return f"{parts[0]}\\…\\{parts[-1]}"
-    return txt[: limit - 1] + "…"
+# ---------------------------------------------------------------- 基础控件
+class PillButton(tk.Canvas):
+    """圆角按钮：primary 实心绿 / soft 浅绿 / ghost 描边。"""
+
+    def __init__(self, master, text, command=None, width=96, height=34, radius=None,
+                 variant="primary", font=None, bg=None):
+        w, h = px(width), px(height)
+        super().__init__(master, width=w, height=h, bd=0, highlightthickness=0,
+                         bg=bg or BG, cursor="hand2")
+        self.var_width, self.var_height = w, h
+        self.radius = px(radius) if radius is not None else h // 2
+        self.command = command
+        self.variant = variant
+        self.label = text
+        self.font = font
+        self._hover = False
+        self._draw()
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<Button-1>", self._click)
+
+    def _colors(self):
+        if self.variant == "primary":
+            return (PRIMARY_DARK if self._hover else PRIMARY), "#FFFFFF", None
+        if self.variant == "soft":
+            return (PRIMARY_TINT if self._hover else PRIMARY_SOFT), PRIMARY_DARK, None
+        if self.variant == "ghost":
+            return (PRIMARY_SOFT if self._hover else SURFACE), TEXT_MID, BORDER
+        return SURFACE, TEXT, BORDER
+
+    def _draw(self):
+        self.delete("all")
+        fill, fg, outline = self._colors()
+        shadow = (*SHADOW[:3], 24) if self.variant == "primary" else None
+        img = rr_image(self.var_width, self.var_height, self.radius, fill,
+                       outline=outline, outline_width=1, shadow=shadow,
+                       shadow_blur=px(5), shadow_dy=px(2))
+        self._photo = ImageTk.PhotoImage(img)
+        self.create_image(0, 0, anchor="nw", image=self._photo)
+        self.create_text(self.var_width / 2, self.var_height / 2 + px(1), text=self.label,
+                         fill=fg, font=self.font)
+
+    def set_text(self, text=None, variant=None):
+        if text is not None:
+            self.label = text
+        if variant is not None:
+            self.variant = variant
+        self._draw()
+
+    def _enter(self, _e=None):
+        self._hover = True
+        self._draw()
+
+    def _leave(self, _e=None):
+        self._hover = False
+        self._draw()
+
+    def _click(self, _e=None):
+        if self.command:
+            self.command()
 
 
-# ---------------------------------------------------------------- 卡片控件
-class AppCard(tk.Frame):
-    def __init__(self, master, app, launcher, index):
-        super().__init__(master, bg=CARD, highlightbackground=BORDER,
-                         highlightthickness=1, bd=0, cursor="hand2")
+class RoundedEntry(tk.Canvas):
+    """圆角输入框：Canvas 画底 + 内嵌无边框 Entry。"""
+
+    def __init__(self, master, textvariable=None, width=240, height=36, radius=18,
+                 font=None, bg=None, glyph=None):
+        w, h = px(width), px(height)
+        super().__init__(master, width=w, height=h, bd=0, highlightthickness=0,
+                         bg=bg or BG)
+        self.w, self.h, self.r = w, h, px(radius)
+        self.var = textvariable or tk.StringVar()
+        self.glyph = glyph
+        self._focused = False
+        self._draw()
+        self.entry = tk.Entry(self, textvariable=self.var, bd=0, relief="flat",
+                              bg=FIELD, fg=TEXT, insertbackground=PRIMARY_DARK,
+                              font=font, highlightthickness=0)
+        self._place_entry()
+        self.entry.bind("<FocusIn>", self._focus_in)
+        self.entry.bind("<FocusOut>", self._focus_out)
+        self.bind("<Button-1>", lambda e: self.entry.focus_set())
+
+    def _pad_left(self):
+        return px(40) if self.glyph else px(15)
+
+    def _place_entry(self):
+        y = (self.h - px(20)) // 2
+        self.entry.place(x=self._pad_left(), y=y, width=max(px(10), self.w - self._pad_left() - px(14)),
+                         height=px(20))
+
+    def _draw(self):
+        self.delete("all")
+        fill = SURFACE if self._focused else FIELD
+        outline = PRIMARY if self._focused else BORDER
+        img = rr_image(self.w, self.h, self.r, fill, outline=outline,
+                       outline_width=max(1, px(1.6)) if self._focused else 1)
+        self._photo = ImageTk.PhotoImage(img)
+        self.create_image(0, 0, anchor="nw", image=self._photo)
+        if self.glyph == "search":
+            cx, cy = px(20), self.h / 2 - px(1)
+            r = px(5)
+            lw = max(1, px(1.4))
+            self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=MUTED, width=lw)
+            self.create_line(cx + r * 0.72, cy + r * 0.72, cx + r * 1.9, cy + r * 1.9,
+                             fill=MUTED, width=lw)
+
+    def resize(self, width):
+        self.w = px(width)
+        self.configure(width=self.w)
+        self._draw()
+        self._place_entry()
+
+    def _focus_in(self, _e=None):
+        self._focused = True
+        self._draw()
+
+    def _focus_out(self, _e=None):
+        self._focused = False
+        self._draw()
+
+    def get(self):
+        return self.var.get()
+
+    def set(self, value):
+        self.var.set(value or "")
+
+
+class Segmented(tk.Canvas):
+    """分段选择器。"""
+
+    def __init__(self, master, choices, value=None, width=384, height=36, font=None,
+                 bg=None, on_change=None):
+        w, h = px(width), px(height)
+        super().__init__(master, width=w, height=h, bd=0, highlightthickness=0,
+                         bg=bg or BG, cursor="hand2")
+        self.choices = choices
+        self.w, self.h = w, h
+        self.value = value or choices[0][0]
+        self.font = font
+        self.on_change = on_change
+        self._draw()
+        self.bind("<Button-1>", self._click)
+
+    def _draw(self):
+        self.delete("all")
+        track = rr_image(self.w, self.h, self.h // 2, FIELD, outline=BORDER, outline_width=1)
+        self._track_photo = ImageTk.PhotoImage(track)
+        self.create_image(0, 0, anchor="nw", image=self._track_photo)
+        pad = px(4)
+        seg_w = (self.w - pad * 2) / len(self.choices)
+        for i, (val, label) in enumerate(self.choices):
+            x1 = pad + i * seg_w
+            if val == self.value:
+                active = rr_image(int(seg_w) - 2, self.h - pad * 2, (self.h - pad * 2) // 2,
+                                  SURFACE, outline=BORDER, outline_width=1,
+                                  shadow=(*SHADOW[:3], 20), shadow_blur=px(4), shadow_dy=px(1))
+                self._active_photo = ImageTk.PhotoImage(active)
+                self.create_image(int(x1) + 1, pad, anchor="nw", image=self._active_photo)
+            self.create_text(x1 + seg_w / 2, self.h / 2 + px(1), text=label,
+                             fill=TEXT if val == self.value else MUTED, font=self.font)
+
+    def _click(self, event):
+        pad = px(4)
+        seg_w = (self.w - pad * 2) / len(self.choices)
+        idx = int(max(0, min(len(self.choices) - 1, (event.x - pad) // seg_w)))
+        self.value = self.choices[idx][0]
+        self._draw()
+        if self.on_change:
+            self.on_change(self.value)
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        if value:
+            self.value = value
+            self._draw()
+
+
+# ---------------------------------------------------------------- 卡片
+class AppCard(tk.Canvas):
+    def __init__(self, master, app, launcher, fonts):
+        self.cw, self.ch = px(CARD_W), px(CARD_H)
+        super().__init__(master, width=self.cw, height=self.ch, bd=0, highlightthickness=0,
+                         bg=BG, cursor="hand2")
         self.app = app
         self.launcher = launcher
-        self.index = index
-        self._img = None
+        self.f = fonts
+        self.selected = False
+        self.hover = False
+        self.running = False
+        self._icon_photo = None
+        self._ph_photo = None
+        self.draw()
+        for seq, cb in (("<Enter>", self._on_enter), ("<Leave>", self._on_leave),
+                        ("<Button-1>", self._on_click), ("<Double-Button-1>", self._on_double),
+                        ("<Button-3>", self._on_right)):
+            self.bind(seq, cb)
 
-        self.configure(width=CARD_W, height=CARD_H)
-        self.pack_propagate(False)
-        self.grid_propagate(False)
+    def _body_box(self):
+        return px(BODY_X), px(BODY_Y), px(BODY_W), px(BODY_H)
 
-        inner = tk.Frame(self, bg=CARD)
-        inner.place(x=12, y=11, width=CARD_W - 24, height=CARD_H - 22)
-        self.inner = inner
+    def draw(self):
+        self.delete("all")
+        ox, oy, bw, bh = self._body_box()
+        fill = SURFACE_HOVER if self.hover and not self.selected else SURFACE
+        ring_w = max(1, px(1.6))
+
+        card = rr_image(self.cw, self.ch, px(BODY_R), fill,
+                        outline=(PRIMARY if self.selected else None),
+                        outline_width=ring_w,
+                        shadow=(*SHADOW[:3], 34 if (self.hover or self.selected) else SHADOW[3]),
+                        shadow_blur=px(7 if not (self.hover or self.selected) else 9),
+                        shadow_dy=px(3))
+        self._body_photo = ImageTk.PhotoImage(card)
+        self.create_image(0, 0, anchor="nw", image=self._body_photo)
 
         # 图标
-        self.icon_label = tk.Label(inner, bg=CARD, bd=0)
-        self.icon_label.place(x=0, y=6, width=72, height=72)
+        icon = self._icon_photo if self._icon_photo is not None else self._placeholder()
+        if icon is not None:
+            self.create_image(ox + px(18), oy + px(18), anchor="nw", image=icon)
 
-        # 名称
-        self.name_label = tk.Label(inner, text=app.get("name", "未命名"), bg=CARD, fg=WHITE,
-                                   font=launcher.f_name, anchor="w", justify="left")
-        self.name_label.place(x=84, y=4, width=CARD_W - 24 - 84, height=22)
+        text_x = ox + px(18) + px(ICON_SIZE) + px(16)
+        right = ox + bw - px(18)
+        avail = right - text_x
 
-        # 分类
-        self.cat_label = tk.Label(inner, text=app.get("category", "") or "未分类", bg=CARD,
-                                  fg=ACCENT, font=launcher.f_small, anchor="w")
-        self.cat_label.place(x=84, y=28, width=CARD_W - 100, height=16)
+        name = ellipsize(self.app.get("name", "未命名"), self.f["card_name"], avail)
+        self.create_text(text_x, oy + px(16), anchor="nw", text=name, fill=TEXT,
+                         font=self.f["card_name"])
 
-        # 描述 / 路径
-        self.desc_label = tk.Label(inner, text=self._subtitle(), bg=CARD, fg=MUTED,
-                                   font=launcher.f_small, anchor="w")
-        self.desc_label.place(x=84, y=46, width=CARD_W - 100, height=16)
+        cat = (self.app.get("category") or "未分类").strip()
+        chip_w = int(self.f["chip"].measure(cat)) + px(18)
+        chip_h = px(19)
+        chip = rr_image(chip_w, chip_h, chip_h // 2, PRIMARY_SOFT)
+        self._chip_photo = ImageTk.PhotoImage(chip)
+        self.create_image(text_x, oy + px(42), anchor="nw", image=self._chip_photo)
+        self.create_text(text_x + chip_w / 2, oy + px(42) + chip_h / 2 + px(1), text=cat,
+                         fill=PRIMARY_DARK, font=self.f["chip"])
 
-        # 状态点
-        self.dot = tk.Label(inner, text="●", bg=CARD, fg=GRAY, font=launcher.f_dot)
-        self.dot.place(x=84, y=68, width=14, height=16)
-        self.status_label = tk.Label(inner, text="未运行", bg=CARD, fg=MUTED,
-                                     font=launcher.f_small, anchor="w")
-        self.status_label.place(x=100, y=68, width=90, height=16)
+        # 启动按钮（先算位置，描述文字要避开它）
+        bw_, bh_ = px(76), px(27)
+        bx, by = right - bw_, oy + bh - px(15) - bh_
 
-        # 启动按钮
-        self.play_btn = tk.Label(inner, text="启 动", bg=BORDER, fg=TEXT,
-                                 font=launcher.f_btn, cursor="hand2")
-        self.play_btn.place(x=CARD_W - 24 - 78, y=62, width=78, height=26)
+        desc = self.app.get("desc") or self.app.get("path", "")
+        self.create_text(text_x, oy + px(66), anchor="nw",
+                         text=ellipsize(desc, self.f["desc"], avail),
+                         fill=MUTED, font=self.f["desc"])
 
-        self._bind_all(self)
+        # 状态（与按钮同一基线）
+        dot_y = by + bh_ / 2
+        self.create_oval(ox + px(18), dot_y - px(3), ox + px(24), dot_y + px(3),
+                         fill=("#63B183" if self.running else "#CFD9D1"), outline="")
+        self.create_text(ox + px(32), dot_y + px(1), anchor="w",
+                         text="运行中" if self.running else "未运行",
+                         fill=("#4F9670" if self.running else MUTED), font=self.f["status"])
+        btn_fill = PRIMARY if not self.running else PRIMARY_SOFT
+        btn_fg = "#FFFFFF" if not self.running else PRIMARY_DARK
+        btn = rr_image(bw_, bh_, bh_ // 2, btn_fill,
+                       shadow=((*SHADOW[:3], 24) if not self.running else None),
+                       shadow_blur=px(5), shadow_dy=px(2))
+        self._btn_photo = ImageTk.PhotoImage(btn)
+        self.create_image(bx, by, anchor="nw", image=self._btn_photo, tags=("btn",))
+        self.create_text(bx + bw_ / 2, by + bh_ / 2 + px(1),
+                         text="运行中" if self.running else "启动",
+                         fill=btn_fg, font=self.f["btn"], tags=("btn",))
+        self.tag_bind("btn", "<Button-1>", self._on_btn)
 
-    def _subtitle(self):
-        desc = self.app.get("desc") or ""
-        if desc:
-            return desc if len(desc) <= 30 else desc[:29] + "…"
-        return short_path(self.app.get("path", ""), 30)
+    def _placeholder(self):
+        if self._ph_photo is None:
+            color = self.app.get("color") or PRIMARY
+            img = letter_icon(self.app.get("name", "?"), color, px(ICON_SIZE))
+            self._ph_photo = ImageTk.PhotoImage(img) if img else None
+        return self._ph_photo
 
-    def _bind_all(self, widget):
-        for w in [widget] + self._children(widget):
-            w.bind("<Enter>", self._on_enter)
-            w.bind("<Leave>", self._on_leave)
-            w.bind("<Button-1>", self._on_click)
-            w.bind("<Double-Button-1>", self._on_double)
-            w.bind("<Button-3>", self._on_right)
-        self.play_btn.bind("<Enter>", lambda e: self.play_btn.configure(bg=ACCENT, fg="#10202b"))
-        self.play_btn.bind("<Leave>", lambda e: self.play_btn.configure(bg=BORDER, fg=TEXT))
-        self.play_btn.bind("<Button-1>", lambda e: self.launcher.toggle(self))
+    def set_icon(self, img):
+        if img is None:
+            return
+        self._icon_photo = ImageTk.PhotoImage(round_icon(img, px(ICON_SIZE)))
+        self.draw()
 
-    def _children(self, widget):
-        out = []
-        for c in widget.winfo_children():
-            out.append(c)
-            out.extend(self._children(c))
-        return out
+    def set_status(self, running):
+        if running != self.running:
+            self.running = running
+            self.draw()
 
-    def set_bg(self, color):
-        for w in [self] + self._children(self):
-            try:
-                w.configure(bg=color)
-            except Exception:
-                pass
+    def set_selected(self, flag):
+        if flag != self.selected:
+            self.selected = flag
+            self.draw()
 
     def _on_enter(self, _e=None):
-        if self is self.launcher.selected_card:
-            return
-        self.set_bg(CARD_HOVER)
+        self.hover = True
+        self.draw()
 
     def _on_leave(self, _e=None):
-        if self is self.launcher.selected_card:
-            self.set_bg(CARD_ACTIVE)
-        else:
-            self.set_bg(CARD)
+        self.hover = False
+        self.draw()
 
     def _on_click(self, _e=None):
         self.launcher.select(self)
-        # 不要 return "break"：否则同一控件上的 <Double-Button-1> 会被吞掉
 
     def _on_double(self, _e=None):
         self.launcher.launch(self.app)
@@ -525,81 +802,90 @@ class AppCard(tk.Frame):
         self.launcher.menu.post(event.x_root, event.y_root)
         return "break"
 
-    def set_selected(self, flag):
-        self.configure(highlightbackground=ACCENT if flag else BORDER)
-
-    def set_status(self, running):
-        self.running = running
-        if running:
-            self.dot.configure(fg=GREEN)
-            self.status_label.configure(text="运行中", fg=GREEN)
-            self.play_btn.configure(text="运 行 中", bg=CARD_HOVER, fg=GREEN)
-        else:
-            self.dot.configure(fg=GRAY)
-            self.status_label.configure(text="未运行", fg=MUTED)
-            self.play_btn.configure(text="启 动", bg=BORDER, fg=TEXT)
-    def apply_icon(self, img):
-        if img is None:
-            return
-        self._img = ImageTk.PhotoImage(img)
-        self.icon_label.configure(image=self._img)
+    def _on_btn(self, _e=None):
+        self.launcher.toggle(self)
+        return "break"
 
 
-# ---------------------------------------------------------------- 编辑对话框
+# ---------------------------------------------------------------- 编辑弹窗
 class EditDialog(tk.Toplevel):
     def __init__(self, master, app=None, on_save=None):
         super().__init__(master)
+        self.withdraw()
         self.title("编辑程序" if app else "添加程序")
         self.configure(bg=BG)
         self.resizable(False, False)
-        self.on_save = on_save
         self.transient(master)
-        self.app = dict(app) if app else {"name": "", "path": "", "args": "", "workdir": "",
-                                          "type": "exe", "category": "", "color": "#4a7fa6",
-                                          "desc": ""}
-        f = master.f_label
-        pad = {"padx": 14, "pady": 6}
+        self.on_save = on_save
+        self.app = dict(app) if app else {
+            "name": "", "path": "", "args": "", "workdir": "",
+            "type": "exe", "category": "", "color": PRIMARY, "desc": "",
+        }
+        f = master.fonts
+        wrap = tk.Frame(self, bg=BG, padx=px(30), pady=px(26))
+        wrap.pack(fill="both", expand=True)
+
+        tk.Label(wrap, text="编辑程序" if app else "添加程序", bg=BG, fg=TEXT,
+                 font=f["dialog_title"], anchor="w").pack(fill="x")
+        tk.Label(wrap, text="填写启动信息；工作目录留空时取路径所在文件夹",
+                 bg=BG, fg=MUTED, font=f["hint"], anchor="w").pack(fill="x",
+                                                                   pady=(px(5), px(16)))
 
         self.vars = {}
-        rows = [("name", "名称"), ("path", "路径 / 网址"), ("workdir", "工作目录"),
-                ("args", "启动参数"), ("type", "类型"), ("category", "分类"), ("desc", "说明")]
-        for i, (key, label) in enumerate(rows):
-            tk.Label(self, text=label, bg=BG, fg=MUTED, font=f, anchor="e", width=8).grid(
-                row=i, column=0, sticky="e", padx=(16, 6), pady=7)
+        self.fields = {}
+        field_w = 384
+
+        def row(label, key, browse=None):
+            box = tk.Frame(wrap, bg=BG)
+            box.pack(fill="x", pady=(0, px(11)))
+            tk.Label(box, text=label, bg=BG, fg=TEXT_MID, font=f["label"],
+                     anchor="w").pack(fill="x")
+            line = tk.Frame(box, bg=BG)
+            line.pack(fill="x", pady=(px(5), 0))
             var = tk.StringVar(value=str(self.app.get(key, "")))
             self.vars[key] = var
-            if key == "type":
-                ent = tk.OptionMenu(self, var, "exe", "web", "folder")
-                ent.configure(bg=CARD, fg=TEXT, activebackground=CARD_HOVER, bd=0,
-                              highlightthickness=0, width=12, font=f)
-                ent.grid(row=i, column=1, sticky="w", pady=7)
-            else:
-                ent = tk.Entry(self, textvariable=var, bg=CARD, fg=TEXT, insertbackground=TEXT,
-                               bd=0, highlightthickness=1, highlightbackground=BORDER,
-                               highlightcolor=ACCENT, font=f, width=44)
-                ent.grid(row=i, column=1, sticky="we", padx=(0, 6), pady=7)
-                if key in ("path", "workdir"):
-                    tk.Button(self, text="浏览", command=lambda k=key: self.browse(k), bg=BORDER,
-                              fg=TEXT, bd=0, font=f, activebackground=CARD_HOVER,
-                              activeforeground=WHITE, width=6).grid(row=i, column=2, padx=(0, 14), pady=7)
+            entry = RoundedEntry(line, var, width=field_w - (74 if browse else 0),
+                                 height=34, radius=11, font=f["field"], bg=BG)
+            entry.pack(side="left")
+            self.fields[key] = entry
+            if browse:
+                PillButton(line, browse[0], command=browse[1], width=64, height=36,
+                           radius=12, variant="ghost", font=f["btn"],
+                           bg=BG).pack(side="left", padx=(px(10), 0))
 
-        btns = tk.Frame(self, bg=BG)
-        btns.grid(row=len(rows), column=0, columnspan=3, sticky="e", padx=16, pady=(10, 16))
-        tk.Button(btns, text="取消", command=self.destroy, bg=BORDER, fg=TEXT, bd=0, font=f,
-                  width=8, activebackground=CARD_HOVER).pack(side="right", padx=(8, 0))
-        tk.Button(btns, text="保存", command=self.save, bg=ACCENT, fg="#0e1b24", bd=0, font=f,
-                  width=8, activebackground="#8fd4fb").pack(side="right")
+        row("名称", "name")
+        row("路径 / 网址", "path", ("浏览", lambda: self._browse("path")))
+        row("工作目录", "workdir", ("浏览", lambda: self._browse("workdir")))
+
+        box = tk.Frame(wrap, bg=BG)
+        box.pack(fill="x", pady=(0, px(11)))
+        tk.Label(box, text="类型", bg=BG, fg=TEXT_MID, font=f["label"],
+                 anchor="w").pack(fill="x")
+        self.seg = Segmented(box, TYPE_CHOICES, value=self.app.get("type", "exe"),
+                             width=field_w, height=36, font=f["field"], bg=BG)
+        self.seg.pack(anchor="w", pady=(px(6), 0))
+
+        row("启动参数", "args")
+        row("分类", "category")
+        row("说明", "desc")
+
+        btns = tk.Frame(wrap, bg=BG)
+        btns.pack(fill="x", pady=(px(10), 0))
+        PillButton(btns, "取消", command=self.destroy, width=88, height=36, radius=18,
+                   variant="ghost", font=f["btn"], bg=BG).pack(side="right")
+        PillButton(btns, "保存", command=self.save, width=100, height=36, radius=18,
+                   variant="primary", font=f["btn"], bg=BG).pack(side="right", padx=(0, px(10)))
 
         self.bind("<Escape>", lambda e: self.destroy())
         self.update_idletasks()
-        self._center(master)
-
-    def _center(self, master):
-        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_reqwidth()) // 2
+        y = master.winfo_rooty() + max(px(24),
+                                       (master.winfo_height() - self.winfo_reqheight()) // 3)
         self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.deiconify()
+        self.after(80, lambda: self.fields["name"].entry.focus_set())
 
-    def browse(self, key):
+    def _browse(self, key):
         if key == "path":
             p = filedialog.askopenfilename(
                 title="选择程序",
@@ -617,6 +903,7 @@ class EditDialog(tk.Toplevel):
 
     def save(self):
         data = {k: v.get().strip() for k, v in self.vars.items()}
+        data["type"] = self.seg.get()
         if not data["name"] or not data["path"]:
             messagebox.showwarning("缺少信息", "名称和路径都必须填写。", parent=self)
             return
@@ -624,6 +911,7 @@ class EditDialog(tk.Toplevel):
             data["path"] = "http://" + data["path"]
         if data["type"] == "exe" and not data["workdir"]:
             data["workdir"] = os.path.dirname(data["path"])
+        data["color"] = self.app.get("color") or PRIMARY
         if self.on_save:
             self.on_save(data)
         self.destroy()
@@ -635,129 +923,147 @@ class Launcher(tk.Tk):
         super().__init__()
         self.cfg = load_config()
         self.apps = self.cfg["apps"]
-        self.procs = {}       # name -> Popen
-        self.watched = {}     # name -> {子进程映像名}（外壳型启动器用）
+        self.procs = {}
+        self.watched = {}
         self.selected_card = None
         self.cards = []
         self._icon_cache = {}
         self._cols = 0
+        self._scroll_frac = 0.0
 
         self.title("AI 启动台")
         self.configure(bg=BG)
-        self.minsize(760, 520)
+        self.minsize(px(680), px(520))
         geo = (self.cfg.get("window") or {}).get("geometry")
         if geo:
             self.geometry(geo)
         else:
             sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            w, h = min(1160, sw - 120), min(780, sh - 140)
-            self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max((sh - h) // 2 - 30, 20)}")
+            w, h = min(px(1120), sw - px(120)), min(px(760), sh - px(140))
+            self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max((sh - h) // 2 - px(30), px(20))}")
         self.update_idletasks()
-        self._apply_dark_titlebar()
-        try:
-            ico = os.path.join(APP_DIR, "icon.ico")
-            if os.path.exists(ico):
-                self.iconbitmap(ico)
-        except Exception:
-            pass
-
+        self._apply_light_titlebar()
         self._init_fonts()
         self._build_ui()
         self._build_menu()
         self.refresh()
         self.bind("<F5>", lambda e: self.refresh())
-        self.bind("<Configure>", self._on_resize)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._clamp_to_screen)
         self.after(300, self._poll_status)
 
-    def _clamp_to_screen(self):
-        """把窗口收进屏幕内：高分屏缩放后 Tk 的 geometry 单位可能比实际大。"""
-        try:
-            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-            w = min(self.winfo_width(), sw - 40)
-            h = min(self.winfo_height(), sh - 100)
-            x = max(10, min(self.winfo_x(), sw - w - 10))
-            y = max(10, min(self.winfo_y(), sh - h - 60))
-            if (w, h) != (self.winfo_width(), self.winfo_height()) or \
-                    (x, y) != (self.winfo_x(), self.winfo_y()):
-                self.geometry(f"{w}x{h}+{x}+{y}")
-        except Exception:
-            pass
-
-    # ---------- 字体
-    def _apply_dark_titlebar(self):
-        """让 Windows 11 的标题栏跟着变深色。"""
+    # ---------- 外观
+    def _apply_light_titlebar(self):
         try:
             hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            value = ctypes.c_int(1)
-            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE（新旧编号）
+            value = ctypes.c_int(0)
+            for attr in (20, 19):
                 ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     hwnd, attr, byref(value), ctypes.sizeof(value))
         except Exception:
             pass
 
     def _init_fonts(self):
-        family = "Microsoft YaHei UI"
-        self.f_title = tkfont.Font(family=family, size=15, weight="bold")
-        self.f_name = tkfont.Font(family=family, size=10, weight="bold")
-        self.f_small = tkfont.Font(family=family, size=8)
-        self.f_label = tkfont.Font(family=family, size=9)
-        self.f_btn = tkfont.Font(family=family, size=9, weight="bold")
-        self.f_dot = tkfont.Font(family="Segoe UI", size=9)
-        self.f_search = tkfont.Font(family=family, size=9)
+        fam = FONT_FAMILY
+        self.fonts = {
+            "logo": tkfont.Font(family=fam, size=10, weight="bold"),
+            "title": tkfont.Font(family=fam, size=15, weight="bold"),
+            "subtitle": tkfont.Font(family=fam, size=8),
+            "card_name": tkfont.Font(family=fam, size=10, weight="bold"),
+            "chip": tkfont.Font(family=fam, size=7),
+            "desc": tkfont.Font(family=fam, size=7),
+            "status": tkfont.Font(family=fam, size=7),
+            "btn": tkfont.Font(family=fam, size=7, weight="bold"),
+            "field": tkfont.Font(family=fam, size=8),
+            "label": tkfont.Font(family=fam, size=8),
+            "hint": tkfont.Font(family=fam, size=7),
+            "footer": tkfont.Font(family=fam, size=7),
+            "dialog_title": tkfont.Font(family=fam, size=12, weight="bold"),
+        }
 
-    # ---------- 界面骨架
+    # ---------- 骨架
     def _build_ui(self):
-        header = tk.Frame(self, bg=HEADER, height=62)
-        header.pack(side="top", fill="x")
-        header.pack_propagate(False)
-
-        tk.Label(header, text="AI 启动台", bg=HEADER, fg=WHITE, font=self.f_title).pack(
-            side="left", padx=(20, 8))
-        tk.Label(header, text="点击卡片启动", bg=HEADER, fg=MUTED, font=self.f_small).pack(
-            side="left", pady=(6, 0))
-
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *a: self.refresh())
-        box = tk.Frame(header, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        box.pack(side="right", padx=(0, 14), pady=16)
-        tk.Label(box, text="搜索", bg=CARD, fg=MUTED, font=self.f_small).pack(
-            side="left", padx=(9, 4))
-        tk.Entry(box, textvariable=self.search_var, bg=CARD, fg=TEXT, insertbackground=TEXT,
-                 bd=0, font=self.f_search, width=18).pack(side="left", padx=(0, 8), pady=4)
-
-        tk.Button(header, text="＋ 添加程序", command=self.add_app, bg=ACCENT, fg="#0e1b24",
-                  bd=0, font=self.f_btn, activebackground="#8fd4fb", cursor="hand2",
-                  padx=12).pack(side="right", padx=(0, 10), pady=17)
+        self.header = tk.Canvas(self, bg=BG, height=px(84), bd=0, highlightthickness=0)
+        self.header.pack(side="top", fill="x", padx=px(PAGE_PAD), pady=(px(8), 0))
+        self.header.bind("<Configure>", lambda e: self._draw_header())
 
         body = tk.Frame(self, bg=BG)
         body.pack(side="top", fill="both", expand=True)
         self.canvas = tk.Canvas(body, bg=BG, highlightthickness=0, bd=0)
-        self.vbar = tk.Scrollbar(body, orient="vertical", command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=self.vbar.set)
-        self.vbar.pack(side="right", fill="y")
-        self.canvas.pack(side="left", fill="both", expand=True)
-
+        self.canvas.pack(side="left", fill="both", expand=True, padx=(px(PAGE_PAD), 0))
         self.grid_frame = tk.Frame(self.canvas, bg=BG)
         self.grid_window = self.canvas.create_window((0, 0), window=self.grid_frame, anchor="nw")
         self.grid_frame.bind(
             "<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")),
-        )
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>", self._on_canvas_resize)
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind_all("<MouseWheel>", self._on_wheel)
 
-        footer = tk.Frame(self, bg=HEADER, height=26)
-        footer.pack(side="bottom", fill="x")
-        footer.pack_propagate(False)
-        self.footer_label = tk.Label(footer, text="", bg=HEADER, fg=MUTED, font=self.f_small,
-                                     anchor="w")
-        self.footer_label.pack(side="left", padx=16)
+        self.sbar = tk.Canvas(body, bg=BG, width=px(8), bd=0, highlightthickness=0)
+        self.sbar.pack(side="right", fill="y", padx=(0, px(20)))
+
+        self.footer = tk.Canvas(self, bg=BG, height=px(40), bd=0, highlightthickness=0)
+        self.footer.pack(side="bottom", fill="x", padx=px(PAGE_PAD), pady=(0, px(2)))
+        self.footer.bind("<Configure>", lambda e: self._draw_footer())
+
+    def _draw_header(self):
+        h = self.header
+        h.delete("all")
+        w = max(h.winfo_width(), px(420))
+
+        logo_s = px(38)
+        logo = rr_image(logo_s, logo_s, px(12), PRIMARY, shadow=(*SHADOW[:3], 36),
+                        shadow_blur=px(6), shadow_dy=px(2))
+        self._logo_photo = ImageTk.PhotoImage(logo)
+        h.create_image(0, px(16), anchor="nw", image=self._logo_photo)
+        h.create_text(logo_s / 2, px(16) + logo_s / 2 + px(1), text="AI", fill="#FFFFFF",
+                      font=self.fonts["logo"])
+        h.create_text(logo_s + px(14), px(18), anchor="w", text="AI 启动台", fill=TEXT,
+                      font=self.fonts["title"])
+        h.create_text(logo_s + px(14), px(42), anchor="w", text="本地 AI 工具 · 一键启动",
+                      fill=MUTED, font=self.fonts["subtitle"])
+
+        btn_w, search_w, gap = 104, 216, 12
+        btn_x = w - px(btn_w)
+        search_x = btn_x - px(gap) - px(search_w)
+
+        if not hasattr(self, "search_box"):
+            self.search_var = tk.StringVar()
+            self.search_var.trace_add("write", lambda *a: self.refresh())
+            self.search_box = RoundedEntry(h, self.search_var, width=search_w, height=36,
+                                           radius=18, font=self.fonts["field"], bg=BG,
+                                           glyph="search")
+            self.btn_add = PillButton(h, "＋ 添加程序", command=self.add_app, width=btn_w,
+                                      height=36, radius=18, variant="primary",
+                                      font=self.fonts["btn"], bg=BG)
+        else:
+            self.search_box.resize(search_w)
+            self.btn_add.var_width = px(btn_w)
+            self.btn_add.configure(width=px(btn_w))
+            self.btn_add._draw()
+        h.create_window(search_x, px(17), anchor="nw", window=self.search_box,
+                        width=px(search_w), height=px(36))
+        h.create_window(btn_x, px(17), anchor="nw", window=self.btn_add,
+                        width=px(btn_w), height=px(36))
+        h.create_line(0, px(78), w, px(78), fill="#E9EFE9")
+
+    def _draw_footer(self):
+        f = self.footer
+        f.delete("all")
+        w = max(f.winfo_width(), px(320))
+        total = len(self.apps)
+        shown = len(self.cards)
+        text = f"共 {total} 个程序" + (f" · 显示 {shown} 个" if shown != total else "")
+        f.create_text(px(2), px(16), anchor="w", text=text, fill=MUTED,
+                      font=self.fonts["footer"])
+        f.create_text(w - px(2), px(16), anchor="e",
+                      text="双击卡片启动 · 右键更多操作 · 滚轮滚动 · F5 刷新",
+                      fill=MUTED, font=self.fonts["footer"])
 
     def _build_menu(self):
-        self.menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT, activebackground=ACCENT,
-                            activeforeground="#0e1b24", bd=0, font=self.f_label)
+        self.menu = tk.Menu(self, tearoff=0, bg=SURFACE, fg=TEXT, activebackground=PRIMARY_SOFT,
+                            activeforeground=PRIMARY_DARK, bd=0, relief="flat",
+                            font=self.fonts["label"], activeborderwidth=0)
         self.menu.add_command(label="启动", command=lambda: self._menu_action("launch"))
         self.menu.add_command(label="停止运行", command=lambda: self._menu_action("stop"))
         self.menu.add_command(label="打开所在文件夹", command=lambda: self._menu_action("folder"))
@@ -780,7 +1086,20 @@ class Launcher(tk.Tk):
         elif action == "remove":
             self.remove_app(app)
 
-    # ---------- 布局与刷新
+    # ---------- 布局
+    def _clamp_to_screen(self):
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w = min(self.winfo_width(), sw - px(40))
+            h = min(self.winfo_height(), sh - px(100))
+            x = max(px(10), min(self.winfo_x(), sw - w - px(10)))
+            y = max(px(10), min(self.winfo_y(), sh - h - px(60)))
+            if (w, h) != (self.winfo_width(), self.winfo_height()) or \
+                    (x, y) != (self.winfo_x(), self.winfo_y()):
+                self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
+
     def _on_canvas_resize(self, event):
         self.canvas.itemconfigure(self.grid_window, width=event.width)
         self._layout(event.width)
@@ -789,41 +1108,59 @@ class Launcher(tk.Tk):
         width = width or self.canvas.winfo_width()
         if width <= 1:
             return
-        usable = max(width - 2 * GAP, CARD_W)
-        cols = max(1, usable // (CARD_W + GAP))
+        cell_w = px(CARD_W) + px(GAP_X)
+        cols = max(1, (width - px(GAP_X)) // cell_w)
         changed = cols != self._cols
         self._cols = cols
         if not changed:
+            self._update_scrollbar()
             return
         for i, card in enumerate(self.cards):
-            card.grid(row=i // cols, column=i % cols, padx=GAP // 2, pady=GAP // 2, sticky="nw")
+            card.grid(row=i // cols, column=i % cols,
+                      padx=px(GAP_X) // 2, pady=px(GAP_Y) // 2, sticky="nw")
         self.grid_frame.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._toggle_scrollbar()
+        self._update_scrollbar()
 
-    def _toggle_scrollbar(self):
-        """内容装得下就把滚动条收起来。"""
+    def _update_scrollbar(self):
         try:
-            need = self.grid_frame.winfo_reqheight()
-            have = self.canvas.winfo_height()
-            if need > have + 2:
-                if not self.vbar.winfo_ismapped():
-                    self.vbar.pack(side="right", fill="y")
-            elif self.vbar.winfo_ismapped():
-                self.vbar.pack_forget()
+            self.grid_frame.update_idletasks()
+            content = self.grid_frame.winfo_reqheight()
+            view = self.canvas.winfo_height()
+            self.sbar.delete("all")
+            if content <= view + px(4) or content <= 0:
+                return
+            frac = min(1.0, view / content)
+            track = view - px(10)
+            thumb_h = max(px(40), int(track * frac))
+            pos = px(5) + int((track - thumb_h) * self._scroll_frac)
+            img = rr_image(px(6), thumb_h, px(3), "#D9E3DB")
+            self._thumb_photo = ImageTk.PhotoImage(img)
+            self.sbar.create_image(px(1), pos, anchor="nw", image=self._thumb_photo)
         except Exception:
             pass
 
     def _on_wheel(self, event):
         widget = self.winfo_containing(event.x_root, event.y_root)
-        while widget is not None:
-            if widget is self.canvas:
-                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-                return
-            widget = getattr(widget, "master", None)
+        if not self._is_inside(widget, self.canvas):
+            return
+        first, last = self.canvas.yview()
+        if first <= 0.0 and last >= 1.0:
+            return
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self._scroll_frac = self.canvas.yview()[0]
+        self._update_scrollbar()
 
+    def _is_inside(self, widget, container):
+        while widget is not None:
+            if widget is container:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
+    # ---------- 列表
     def refresh(self):
-        query = self.search_var.get().strip().lower()
+        query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
         visible = [a for a in self.apps
                    if not query or query in a.get("name", "").lower()
                    or query in a.get("category", "").lower()
@@ -835,34 +1172,30 @@ class Launcher(tk.Tk):
         self.selected_card = None
         self._cols = 0
 
-        for i, app in enumerate(visible):
-            card = AppCard(self.grid_frame, app, self, i)
-            card.grid(row=i // 3, column=i % 3, padx=GAP // 2, pady=GAP // 2, sticky="nw")
+        for app in visible:
+            card = AppCard(self.grid_frame, app, self, self.fonts)
+            card.grid(row=0, column=0, padx=px(GAP_X) // 2, pady=px(GAP_Y) // 2, sticky="nw")
             self.cards.append(card)
 
         self.after(1, self._layout)
         self._start_icon_loader()
-        total = len(self.apps)
-        self.footer_label.configure(
-            text=f"共 {total} 个程序" + (f" · 匹配 {len(visible)} 个" if query else "")
-            + "    │    双击卡片 = 启动 · 右键 = 更多操作 · F5 刷新"
-        )
-        if visible and not self.selected_card:
-            self.select(self.cards[0], hover=False)
+        if hasattr(self, "footer"):
+            self._draw_footer()
+        if visible:
+            self.select(self.cards[0], force=True)
 
     def _start_icon_loader(self):
-        """在单个后台线程里按顺序取图标，避免并发调用 shell API 偶发失败。"""
         pairs = [(card, dict(card.app)) for card in self.cards]
 
         def work():
             for card, app in pairs:
-                key = (app.get("path", ""), app.get("color", "#4a7fa6"), app.get("name", ""))
-                if key in self._icon_cache:
-                    img = self._icon_cache[key]
-                else:
+                key = (app.get("path", ""), app.get("color", PRIMARY), app.get("name", ""))
+                img = self._icon_cache.get(key)
+                if img is None:
                     img = self._make_icon(app)
+                    self._icon_cache[key] = img
                 try:
-                    self.after(0, lambda c=card, k=key, i=img: self._apply_icon(c, k, i))
+                    self.after(0, lambda c=card, i=img: c.set_icon(i))
                 except Exception:
                     return
 
@@ -871,39 +1204,30 @@ class Launcher(tk.Tk):
     @staticmethod
     def _make_icon(app):
         kind = app.get("type", "exe")
-        color = app.get("color") or "#4a7fa6"
+        color = app.get("color") or PRIMARY
+        size = px(ICON_SIZE) * 2
         if kind == "web":
-            return web_icon(color)
+            return web_icon(color, size)
         path = app.get("path", "")
         ext = os.path.splitext(path)[1].lower()
         if kind == "folder" or os.path.isdir(path):
-            return load_icon(path) or letter_icon(app.get("name", "?"), color)
+            return load_icon(path, size) or letter_icon(app.get("name", "?"), color, size)
         if ext in (".bat", ".cmd", ".ps1", ".vbs"):
-            # 批处理的图标是通用的齿轮，不如字母块好看
-            return letter_icon(app.get("name", "?"), color)
-        return load_icon(path) or letter_icon(app.get("name", "?"), color)
+            return letter_icon(app.get("name", "?"), color, size)
+        return load_icon(path, size) or letter_icon(app.get("name", "?"), color, size)
 
-    def _apply_icon(self, card, key, img):
-        self._icon_cache[key] = img
-        try:
-            card.apply_icon(img)
-        except Exception:
-            pass
-
-    def select(self, card, hover=True):
-        if self.selected_card is card:
+    def select(self, card, force=False):
+        if self.selected_card is card and not force:
             return
         if self.selected_card is not None:
             try:
                 self.selected_card.set_selected(False)
-                self.selected_card.set_bg(CARD)
             except Exception:
                 pass
         self.selected_card = card
         card.set_selected(True)
-        if hover:
-            card.set_bg(CARD_ACTIVE)
 
+    # ---------- 启动 / 停止
     def _is_running(self, app):
         images = running_images()
         name = app.get("name", "")
@@ -915,7 +1239,6 @@ class Launcher(tk.Tk):
             return True
         return bool(self.watched.get(name, set()) & images)
 
-    # ---------- 启动
     def launch(self, app):
         kind = app.get("type", "exe")
         path = app.get("path", "")
@@ -949,7 +1272,7 @@ class Launcher(tk.Tk):
                 cmd = ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", path]
             elif ext == ".lnk":
                 os.startfile(path)
-                self._toast(f"已启动 {app.get('name')}")
+                self._toast(f"已启动 {name}")
                 return
             else:
                 cmd = [path]
@@ -964,7 +1287,19 @@ class Launcher(tk.Tk):
             self.after(1000, self._poll_status)
         except Exception as exc:
             traceback.print_exc()
-            messagebox.showerror("启动失败", f"{app.get('name')}\n\n{exc}")
+            messagebox.showerror("启动失败", f"{name}\n\n{exc}")
+
+    def _capture_children(self, name, pid, launched_at):
+        kids = set()
+        for cpid, cname in child_processes(pid):
+            if cname in _GENERIC_IMAGES:
+                continue
+            started = process_start_time(cpid)
+            if started is not None and started >= launched_at - 3:
+                kids.add(cname)
+        if kids:
+            self.watched.setdefault(name, set()).update(kids)
+            self._poll_status()
 
     def open_folder(self, app):
         path = app.get("path", "")
@@ -977,7 +1312,6 @@ class Launcher(tk.Tk):
             subprocess.Popen(["explorer.exe", "/select,", os.path.normpath(path)])
 
     def toggle(self, card):
-        """点卡片上的按钮：没运行就启动，在运行就询问是否结束。"""
         if getattr(card, "running", False):
             self.stop_app(card.app)
         else:
@@ -1029,7 +1363,8 @@ class Launcher(tk.Tk):
         EditDialog(self, app, on_save=on_save)
 
     def remove_app(self, app):
-        if messagebox.askyesno("移除", f"从列表移除「{app.get('name')}」？\n（不会删除磁盘上的文件）"):
+        if messagebox.askyesno("移除", f"从列表移除「{app.get('name')}」？\n"
+                                       f"（不会删除磁盘上的文件）"):
             self.apps.remove(app)
             self._persist()
             self.refresh()
@@ -1041,21 +1376,7 @@ class Launcher(tk.Tk):
         except Exception as exc:
             messagebox.showerror("保存失败", str(exc))
 
-    # ---------- 状态轮询
-    def _capture_children(self, name, pid, launched_at):
-        """记录下来外壳进程拉起的子进程名，便于以后判断“是否在运行”。"""
-        kids = set()
-        for cpid, cname in child_processes(pid):
-            if cname in _GENERIC_IMAGES:
-                continue
-            started = process_start_time(cpid)
-            # 只认启动之后才出现的子进程，排除 PID 复用带来的无关进程
-            if started is not None and started >= launched_at - 3:
-                kids.add(cname)
-        if kids:
-            self.watched.setdefault(name, set()).update(kids)
-            self._poll_status()
-
+    # ---------- 状态
     def _poll_status(self):
         images = running_images()
         for card in list(self.cards):
@@ -1071,16 +1392,17 @@ class Launcher(tk.Tk):
         self.after(2500, self._poll_status)
 
     def _toast(self, text):
-        self.footer_label.configure(text=text)
-        self.after(4000, lambda: self.footer_label.configure(
-            text=f"共 {len(self.apps)} 个程序    │    "
-                 "双击卡片 = 启动 · 右键 = 更多操作 · F5 刷新"))
+        if not hasattr(self, "footer"):
+            return
+        try:
+            self.footer.delete("toast")
+            self.footer.create_text(px(2), px(28), anchor="w", text=text, fill=PRIMARY_DARK,
+                                    font=self.fonts["footer"], tags=("toast",))
+            self.after(4000, lambda: self.footer.delete("toast"))
+        except Exception:
+            pass
 
     # ---------- 收尾
-    def _on_resize(self, event):
-        if event.widget is self:
-            self._geometry = self.geometry()
-
     def _on_close(self):
         self.cfg["window"] = {"geometry": self.geometry()}
         self.cfg["apps"] = self.apps
@@ -1091,32 +1413,24 @@ class Launcher(tk.Tk):
         self.destroy()
 
 
+# ---------------------------------------------------------------- 入口
 def ensure_app_icon():
-    """第一次运行时生成窗口/快捷方式图标。"""
     if not HAS_PIL:
         return
     path = os.path.join(APP_DIR, "icon.ico")
-    if os.path.exists(path):
-        return
     try:
-        from PIL import ImageFont
         size = 256
         img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
-        d.rounded_rectangle([0, 0, size - 1, size - 1], radius=58, fill="#1b2838")
-        d.rounded_rectangle([7, 7, size - 8, size - 8], radius=52, outline=ACCENT, width=7)
-        try:
-            font = ImageFont.truetype("msyhbd.ttc", 118)
-        except Exception:
-            font = ImageFont.load_default()
-        d.text((size / 2, size / 2 - 4), "AI", font=font, fill=ACCENT, anchor="mm")
+        d.rounded_rectangle([0, 0, size - 1, size - 1], radius=62, fill=PRIMARY)
+        d.text((size / 2, size / 2 - 4), "AI", font=_pil_font(118, True), fill="#FFFFFF",
+               anchor="mm")
         img.save(path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     except Exception:
         pass
 
 
 def selftest():
-    """--selftest：不显示窗口，直接验证“启动 + 状态检测”链路。"""
     app = Launcher()
     app.withdraw()
     app.update()
@@ -1128,13 +1442,9 @@ def selftest():
     def check(step=0):
         app._poll_status()
         card = next((c for c in app.cards if c.app is target), None)
-        state = getattr(card, "running", None)
-        print(f"[selftest] {step * 2}s 状态: running={state} "
-              f"images={sorted(i for i in running_images() if '绘世' in i or i == app_image_name(target))}")
+        print(f"[selftest] {step * 2}s running={getattr(card, 'running', None)}")
         if step >= 4:
             proc = app.procs.get(target["name"])
-            print(f"[selftest] 已跟踪进程: {proc.pid if proc else None} "
-                  f"子进程={app.watched.get(target['name'])}")
             if proc and proc.poll() is None:
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -1150,6 +1460,17 @@ def selftest():
 
 
 def main():
+    if not HAS_PIL:
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("缺少依赖",
+                                 "本程序需要 Pillow 才能绘制圆角卡片与图标。\n\n"
+                                 "请在命令行执行：pip install pillow")
+            root.destroy()
+        except Exception:
+            print("需要 Pillow：pip install pillow")
+        sys.exit(1)
     ensure_app_icon()
     if "--selftest" in sys.argv:
         selftest()
