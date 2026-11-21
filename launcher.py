@@ -668,7 +668,22 @@ class Launcher(tk.Tk):
         self.bind("<F5>", lambda e: self.refresh())
         self.bind("<Configure>", self._on_resize)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(120, self._clamp_to_screen)
         self.after(300, self._poll_status)
+
+    def _clamp_to_screen(self):
+        """把窗口收进屏幕内：高分屏缩放后 Tk 的 geometry 单位可能比实际大。"""
+        try:
+            sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+            w = min(self.winfo_width(), sw - 40)
+            h = min(self.winfo_height(), sh - 100)
+            x = max(10, min(self.winfo_x(), sw - w - 10))
+            y = max(10, min(self.winfo_y(), sh - h - 60))
+            if (w, h) != (self.winfo_width(), self.winfo_height()) or \
+                    (x, y) != (self.winfo_x(), self.winfo_y()):
+                self.geometry(f"{w}x{h}+{x}+{y}")
+        except Exception:
+            pass
 
     # ---------- 字体
     def _apply_dark_titlebar(self):
